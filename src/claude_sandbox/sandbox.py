@@ -45,7 +45,9 @@ def _load_sandstorm_config() -> dict | None:
     return None
 
 
-async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, None]:
+async def run_agent_in_sandbox(
+    request: QueryRequest, request_id: str = ""
+) -> AsyncGenerator[str, None]:
     """Create an E2B sandbox, run the Claude Agent SDK query(), and yield messages."""
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
@@ -58,6 +60,8 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
 
     sandstorm_config = _load_sandstorm_config() or {}
 
+    logger.info("[%s] Creating sandbox template=%s", request_id, TEMPLATE)
+
     try:
         sbx = await AsyncSandbox.create(
             template=TEMPLATE,
@@ -68,7 +72,8 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
     except NotFoundException:
         # Custom template not found — fall back to default template + runtime SDK install
         logger.warning(
-            "Template %r not found, falling back to %r (adds ~15s overhead)",
+            "[%s] Template %r not found, falling back to %r (adds ~15s overhead)",
+            request_id,
             TEMPLATE,
             FALLBACK_TEMPLATE,
         )
@@ -86,6 +91,8 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
             timeout=120,
         )
 
+    logger.info("[%s] Sandbox created: %s", request_id, sbx.sandbox_id)
+
     try:
         # Write Claude Agent SDK settings to the sandbox
         settings = {
@@ -100,6 +107,7 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
 
         # Upload user files to the sandbox (path traversal prevented by model validation)
         if request.files:
+            logger.info("[%s] Uploading %d files", request_id, len(request.files))
             # Collect parent dirs that need creation (deduplicate, skip top-level files)
             dirs_to_create: set[str] = set()
             for path in request.files:
@@ -141,6 +149,13 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
         await sbx.files.write("/opt/agent-runner/agent_config.json", json.dumps(agent_config))
 
         # Run the SDK query() via the runner script
+        logger.info(
+            "[%s] Starting agent (model=%s, max_turns=%s)",
+            request_id,
+            agent_config.get("model"),
+            agent_config.get("max_turns"),
+        )
+
         async def run_command():
             try:
                 await sbx.commands.run(
@@ -176,4 +191,5 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
             logger.warning("Task exception suppressed (runner likely streamed the error)", exc_info=True)
 
     finally:
+        logger.info("[%s] Destroying sandbox %s", request_id, sbx.sandbox_id)
         await sbx.kill()
