@@ -161,6 +161,7 @@ async def run_agent_in_sandbox(
 
     logger.info("[%s] Sandbox created: %s", request_id, sbx.sandbox_id)
 
+    task = None
     try:
         # Write Claude Agent SDK settings to the sandbox
         settings = {
@@ -252,12 +253,20 @@ async def run_agent_in_sandbox(
             if line:
                 yield line
 
-        # Suppress expected command exit exceptions (errors already streamed by runner)
-        try:
-            await task
-        except Exception:
-            logger.warning("[%s] Task exception suppressed (runner likely streamed the error)", request_id, exc_info=True)
-
     finally:
+        # Cancel the background command task before destroying the sandbox.
+        # task may be None if an error occurred before create_task().
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        elif task is not None:
+            # Task finished — suppress any command exit exception
+            try:
+                task.result()
+            except Exception:
+                logger.warning("[%s] Task exception suppressed (runner likely streamed the error)", request_id, exc_info=True)
         logger.info("[%s] Destroying sandbox %s", request_id, sbx.sandbox_id)
         await sbx.kill()
