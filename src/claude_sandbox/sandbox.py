@@ -117,7 +117,7 @@ async def run_agent_in_sandbox(request: QueryRequest) -> AsyncGenerator[str, Non
             try:
                 await sbx.commands.run(
                     "node /opt/agent-runner/runner.mjs",
-                    timeout=0,
+                    timeout=1800,
                     on_stdout=lambda data: queue.put_nowait(
                         data if isinstance(data, str) else str(data)
                     ),
