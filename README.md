@@ -54,7 +54,7 @@ uv sync
 cp .env.example .env   # then edit with your keys
 
 # Start the server
-uv run python -m uvicorn claude_sandbox.main:app --reload
+uv run python -m uvicorn sandstorm.main:app --reload
 
 # Run your first agent
 curl -N -X POST http://localhost:8000/query \
@@ -339,7 +339,7 @@ Use [Gunicorn](https://gunicorn.org/) with uvicorn workers. Each worker handles 
 
 ```bash
 pip install gunicorn
-gunicorn claude_sandbox.main:app \
+gunicorn sandstorm.main:app \
   --worker-class uvicorn.workers.UvicornWorker \
   --workers 4 \
   --bind 0.0.0.0:8000 \
@@ -398,7 +398,7 @@ WORKDIR /app
 COPY . .
 RUN pip install --no-cache-dir .
 EXPOSE 8000
-CMD ["gunicorn", "claude_sandbox.main:app", \
+CMD ["gunicorn", "sandstorm.main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", "--bind", "0.0.0.0:8000", "--timeout", "600"]
 ```

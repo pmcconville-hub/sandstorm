@@ -20,7 +20,7 @@ TEMPLATE = "work-43ca/sandstorm"
 FALLBACK_TEMPLATE = "claude-code"
 
 # Load the runner script that executes inside the sandbox
-_RUNNER_SCRIPT = files("claude_sandbox").joinpath("runner.mjs").read_text()
+_RUNNER_SCRIPT = files("sandstorm").joinpath("runner.mjs").read_text()
 
 # Path to project-level sandstorm config (resolved relative to this file)
 _CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "sandstorm.json"
