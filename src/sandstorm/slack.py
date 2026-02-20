@@ -29,7 +29,21 @@ _MAX_FILE_SIZE = 10 * 1024 * 1024
 _MAX_SANDBOX_POOL = 1000
 
 # MIME prefixes treated as binary (downloaded as bytes, not text)
-_BINARY_MIME_PREFIXES = ("image/", "audio/", "video/", "application/pdf", "application/zip")
+_BINARY_MIME_PREFIXES = (
+    "image/",
+    "audio/",
+    "video/",
+    "application/pdf",
+    "application/zip",
+    "application/vnd.openxmlformats-",  # .xlsx, .docx, .pptx
+    "application/vnd.ms-",  # legacy .xls, .doc, .ppt
+    "application/msword",  # legacy .doc alternative
+    "application/x-7z-compressed",
+    "application/x-rar-compressed",
+    "application/x-tar",
+    "application/gzip",
+    "application/octet-stream",  # generic binary fallback
+)
 
 
 # ── Metadata blocks ──────────────────────────────────────────────────────────
@@ -92,7 +106,7 @@ def _build_query_request(prompt: str, files: dict[str, str] | None = None) -> Qu
     Uses SANDSTORM_SLACK_MODEL, SANDSTORM_SLACK_TIMEOUT env vars.
     API keys resolved by QueryRequest.resolve_api_keys() as usual.
     """
-    model = os.environ.get("SANDSTORM_SLACK_MODEL")
+    model = os.environ.get("SANDSTORM_SLACK_MODEL", "claude-sonnet-4-6")
     timeout_str = os.environ.get("SANDSTORM_SLACK_TIMEOUT", "300")
     try:
         timeout = int(timeout_str)
@@ -104,6 +118,7 @@ def _build_query_request(prompt: str, files: dict[str, str] | None = None) -> Qu
         model=model,
         timeout=timeout,
         files=files,
+        output_format={},  # Slack is conversational — skip structured output
         anthropic_api_key=None,
         e2b_api_key=None,
         openrouter_api_key=None,
@@ -138,7 +153,34 @@ async def _fetch_thread_messages(client, channel: str, thread_ts: str) -> list[d
         return []
 
 
-def _gather_thread_context(messages: list[dict], bot_user_id: str) -> str:
+async def _resolve_user_names(client, messages: list[dict], bot_user_id: str) -> dict[str, str]:
+    """Resolve Slack user IDs to display names.
+
+    Returns {uid: display_name} mapping. Falls back to uid on API error.
+    Uses asyncio.gather() to resolve all users concurrently.
+    """
+    uids = {
+        msg.get("user", "")
+        for msg in messages
+        if msg.get("user") and msg.get("user") != bot_user_id
+    }
+
+    async def _resolve(uid: str) -> tuple[str, str]:
+        try:
+            resp = await client.users_info(user=uid)
+            profile = resp.get("user", {}).get("profile", {})
+            return uid, profile.get("display_name") or profile.get("real_name") or uid
+        except Exception:
+            logger.warning("Failed to resolve user name for %s", uid)
+            return uid, uid
+
+    results = await asyncio.gather(*(_resolve(uid) for uid in uids))
+    return dict(results)
+
+
+def _gather_thread_context(
+    messages: list[dict], bot_user_id: str, *, user_names: dict[str, str] | None = None
+) -> str:
     """Format thread messages into a context string.
 
     Includes bot's own messages (prefixed [Sandstorm]) for conversational
@@ -160,8 +202,10 @@ def _gather_thread_context(messages: list[dict], bot_user_id: str) -> str:
                 lines.append(f"[Sandstorm] {text}")
             continue  # skip file attachments from bot
 
+        display = user_names.get(user, user) if user_names else user
+
         if text:
-            lines.append(f"[{user}] {text}")
+            lines.append(f"[{display}] {text}")
 
         # Note attached files
         for f in msg.get("files", []):
@@ -169,12 +213,28 @@ def _gather_thread_context(messages: list[dict], bot_user_id: str) -> str:
             mimetype = f.get("mimetype", "unknown")
             size = f.get("size", 0)
             size_kb = size / 1024
-            lines.append(f"[{user}] [attached: {name} ({mimetype}, {size_kb:.0f}KB)]")
+            lines.append(f"[{display}] [attached: {name} ({mimetype}, {size_kb:.0f}KB)]")
 
     return "\n".join(lines)
 
 
 # ── File handling ─────────────────────────────────────────────────────────────
+
+
+def _unique_filename(name: str, seen: set[str]) -> str:
+    """Return a unique filename, appending _1, _2, etc. for duplicates."""
+    if name not in seen:
+        seen.add(name)
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    for i in range(1, 100):
+        candidate = f"{stem}_{i}.{ext}" if ext else f"{stem}_{i}"
+        if candidate not in seen:
+            seen.add(candidate)
+            return candidate
+    return name  # fallback
 
 
 async def _download_thread_files(
@@ -187,58 +247,61 @@ async def _download_thread_files(
       - binary_files: {filename: bytes_content} for sandbox upload
     Skips files > 10MB.
     """
+    try:
+        import aiohttp
+    except ImportError:
+        logger.warning("aiohttp not available for file downloads")
+        return {}, {}
+
     text_files: dict[str, str] = {}
     binary_files: dict[str, bytes] = {}
-    for msg in messages:
-        if msg.get("user") == bot_user_id:
-            continue
+    seen: set[str] = set()
 
-        for f in msg.get("files", []):
-            name = f.get("name", "unknown")
-            mimetype = f.get("mimetype", "")
-            size = f.get("size", 0)
-            is_binary = any(mimetype.startswith(prefix) for prefix in _BINARY_MIME_PREFIXES)
-
-            # Skip large files
-            if size > _MAX_FILE_SIZE:
-                logger.warning("Skipping large file: %s (%d bytes)", name, size)
+    headers = {"Authorization": f"Bearer {client.token}"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for msg in messages:
+            if msg.get("user") == bot_user_id:
                 continue
 
-            url = f.get("url_private_download") or f.get("url_private")
-            if not url:
-                continue
+            for f in msg.get("files", []):
+                raw_name = f.get("name", "unknown")
+                name = _unique_filename(raw_name, seen)
+                mimetype = f.get("mimetype", "")
+                size = f.get("size", 0)
+                is_binary = any(mimetype.startswith(prefix) for prefix in _BINARY_MIME_PREFIXES)
 
-            # Text files: try files_info API first (returns content directly)
-            if not is_binary:
+                # Skip large files
+                if size > _MAX_FILE_SIZE:
+                    logger.warning("Skipping large file: %s (%d bytes)", name, size)
+                    continue
+
+                url = f.get("url_private_download") or f.get("url_private")
+                if not url:
+                    continue
+
+                # Text files: try files_info API first (returns content directly)
+                if not is_binary:
+                    try:
+                        resp = await client.files_info(file=f["id"])
+                        content_resp = resp.get("content")
+                        if content_resp:
+                            text_files[name] = content_resp
+                            continue
+                    except Exception:
+                        pass
+
+                # Download via URL with bot token auth
                 try:
-                    resp = await client.files_info(file=f["id"])
-                    content_resp = resp.get("content")
-                    if content_resp:
-                        text_files[name] = content_resp
-                        continue
-                except Exception:
-                    pass
-
-            # Download via URL with bot token auth
-            try:
-                import aiohttp
-
-                headers = {"Authorization": f"Bearer {client.token}"}
-                async with (
-                    aiohttp.ClientSession() as session,
-                    session.get(url, headers=headers) as resp,
-                ):
-                    if resp.status == 200:
-                        if is_binary:
-                            binary_files[name] = await resp.read()
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            if is_binary:
+                                binary_files[name] = await resp.read()
+                            else:
+                                text_files[name] = await resp.text()
                         else:
-                            text_files[name] = await resp.text()
-                    else:
-                        logger.warning("Failed to download %s: HTTP %d", name, resp.status)
-            except ImportError:
-                logger.warning("aiohttp not available for file download of %s", name)
-            except Exception:
-                logger.warning("Failed to download file: %s", name, exc_info=True)
+                            logger.warning("Failed to download %s: HTTP %d", name, resp.status)
+                except Exception:
+                    logger.warning("Failed to download file: %s", name, exc_info=True)
 
     return text_files, binary_files
 
@@ -277,6 +340,7 @@ async def _stream_to_slack(
 
     start = time.monotonic()
     stopped = False
+    has_streamed_text = False
 
     run_store.create(
         id=run_id,
@@ -314,8 +378,10 @@ async def _stream_to_slack(
                     if block.get("type") == "text":
                         text = block["text"]
                         if text:
+                            prefix = "\n\n" if has_streamed_text else ""
                             try:
-                                await streamer.append(markdown_text=text)
+                                await streamer.append(markdown_text=prefix + text)
+                                has_streamed_text = True
                                 logger.info("[%s] Streamed %d chars", run_id, len(text))
                             except Exception:
                                 logger.error("[%s] streamer.append failed", run_id, exc_info=True)
@@ -410,29 +476,15 @@ def create_slack_app(
     # Lock serializes concurrent @mentions in the same thread
     _sandbox_pool: dict[tuple[str, str], tuple[str | None, asyncio.Lock]] = {}
 
-    # ── 1. @mention handler — primary interaction in channels ──
+    # ── Shared helpers (close over _sandbox_pool) ──
 
-    @app.event("app_mention")
-    async def handle_mention(event, client, say, context):
-        channel = event["channel"]
-        thread_ts = event.get("thread_ts", event["ts"])
-        user_id = event["user"]
-        bot_user_id = context["bot_user_id"]
-
-        # Extract prompt (strip @mention)
-        raw_text = event.get("text", "")
-        prompt = re.sub(r"<@[A-Z0-9]+>", "", raw_text).strip()
-        if not prompt:
-            await say(text="Mention me with a task!", thread_ts=thread_ts)
-            return
-
-        # Add :eyes: reaction as status indicator (set_status not available here)
-        with contextlib.suppress(Exception):
-            await client.reactions_add(channel=channel, timestamp=event["ts"], name="eyes")
-
-        run_id = uuid.uuid4().hex[:8]
+    async def _prepare_prompt(
+        client, channel: str, thread_ts: str, bot_user_id: str, prompt: str
+    ) -> tuple[QueryRequest, dict[str, bytes]]:
+        """Fetch thread context, resolve names, download files, build request."""
         messages = await _fetch_thread_messages(client, channel, thread_ts)
-        thread_context = _gather_thread_context(messages, bot_user_id)
+        user_names = await _resolve_user_names(client, messages, bot_user_id)
+        thread_context = _gather_thread_context(messages, bot_user_id, user_names=user_names)
         text_files, binary_files = await _download_thread_files(client, messages, bot_user_id)
 
         full_prompt = prompt
@@ -445,15 +497,27 @@ def create_slack_app(
             full_prompt += f"\n\nFiles available in your working directory:\n{file_list}"
 
         request = _build_query_request(full_prompt, text_files or None)
+        return request, binary_files
 
-        # Get or create sandbox pool entry for this thread
+    async def _run_in_sandbox_pool(
+        *,
+        request: QueryRequest,
+        run_id: str,
+        client,
+        channel: str,
+        thread_ts: str,
+        context,
+        user_id: str,
+        binary_files: dict[str, bytes],
+        set_status: Callable | None = None,
+    ) -> dict:
+        """Run agent with sandbox reuse, pool management, and eviction."""
         key = (channel, thread_ts)
         if key not in _sandbox_pool:
             _sandbox_pool[key] = (None, asyncio.Lock())
         _, lock = _sandbox_pool[key]
 
         async with lock:
-            # Read sandbox_id inside lock to avoid TOCTOU race
             existing_sandbox_id = _sandbox_pool[key][0]
             sandbox_id_out: list[str] = []
             reuse_succeeded = False
@@ -477,13 +541,13 @@ def create_slack_app(
                     client,
                     channel,
                     thread_ts,
+                    set_status=set_status,
                     keep_alive=True,
                     sandbox_id=existing_sandbox_id,
                     binary_files=binary_files or None,
                 )
                 reuse_succeeded = not metadata.get("error")
                 if not reuse_succeeded:
-                    # Sandbox expired or errored — clear dead entry
                     _sandbox_pool[key] = (None, lock)
                     logger.warning(
                         "[%s] Sandbox %s failed, creating new",
@@ -492,20 +556,20 @@ def create_slack_app(
                     )
 
             if not reuse_succeeded:
-                # Create new sandbox and keep it alive
                 streamer = await client.chat_stream(
                     channel=channel,
                     thread_ts=thread_ts,
                     recipient_team_id=context.get("team_id"),
                     recipient_user_id=user_id,
                 )
-                await _stream_to_slack(
+                metadata = await _stream_to_slack(
                     request,
                     run_id,
                     streamer,
                     client,
                     channel,
                     thread_ts,
+                    set_status=set_status,
                     keep_alive=True,
                     sandbox_id_out=sandbox_id_out,
                     binary_files=binary_files or None,
@@ -514,12 +578,52 @@ def create_slack_app(
                 _sandbox_pool.pop(key, None)
                 _sandbox_pool[key] = (new_id, lock)
 
-        # Evict oldest entries if pool is too large (sandboxes auto-die via E2B timeout)
+        # Evict oldest entries if pool is too large
         while len(_sandbox_pool) > _MAX_SANDBOX_POOL:
             oldest_key = next(iter(_sandbox_pool))
             evicted_id, _ = _sandbox_pool.pop(oldest_key)
             if evicted_id:
-                logger.debug("Evicted sandbox %s from pool (will auto-expire)", evicted_id)
+                logger.debug(
+                    "Evicted sandbox %s from pool (will auto-expire)",
+                    evicted_id,
+                )
+
+        return metadata
+
+    # ── 1. @mention handler — primary interaction in channels ──
+
+    @app.event("app_mention")
+    async def handle_mention(event, client, say, context):
+        channel = event["channel"]
+        thread_ts = event.get("thread_ts", event["ts"])
+        user_id = event["user"]
+        bot_user_id = context["bot_user_id"]
+
+        # Extract prompt (strip @mention)
+        raw_text = event.get("text", "")
+        prompt = re.sub(r"<@[A-Z0-9]+>", "", raw_text).strip()
+        if not prompt:
+            await say(text="Mention me with a task!", thread_ts=thread_ts)
+            return
+
+        # Add :eyes: reaction as status indicator
+        with contextlib.suppress(Exception):
+            await client.reactions_add(channel=channel, timestamp=event["ts"], name="eyes")
+
+        run_id = uuid.uuid4().hex[:8]
+        request, binary_files = await _prepare_prompt(
+            client, channel, thread_ts, bot_user_id, prompt
+        )
+        await _run_in_sandbox_pool(
+            request=request,
+            run_id=run_id,
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            context=context,
+            user_id=user_id,
+            binary_files=binary_files,
+        )
 
         # Remove :eyes: reaction on completion
         with contextlib.suppress(Exception):
@@ -562,145 +666,64 @@ def create_slack_app(
 
         await set_status("Spinning up sandbox...")
         run_id = uuid.uuid4().hex[:8]
-
-        # Thread context + file downloads (same as @mention handler)
-        messages = await _fetch_thread_messages(client, channel_id, thread_ts)
-        thread_context = _gather_thread_context(messages, bot_user_id)
-        text_files, binary_files = await _download_thread_files(client, messages, bot_user_id)
-
-        full_prompt = prompt
-        if thread_context:
-            full_prompt = f"Thread context:\n{thread_context}\n\nUser request: {prompt}"
-
-        all_files = list(text_files.keys()) + list(binary_files.keys())
-        if all_files:
-            file_list = "\n".join(f"- /home/user/{f}" for f in all_files)
-            full_prompt += f"\n\nFiles available in your working directory:\n{file_list}"
-
-        request = _build_query_request(full_prompt, text_files or None)
-
-        # Sandbox reuse (same pool as @mention handler)
-        key = (channel_id, thread_ts)
-        if key not in _sandbox_pool:
-            _sandbox_pool[key] = (None, asyncio.Lock())
-        _, lock = _sandbox_pool[key]
-
-        async with lock:
-            existing_sandbox_id = _sandbox_pool[key][0]
-            sandbox_id_out: list[str] = []
-            reuse_succeeded = False
-            if existing_sandbox_id:
-                logger.info("[%s] DM reusing sandbox %s", run_id, existing_sandbox_id)
-                streamer = await client.chat_stream(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    recipient_team_id=context.get("team_id"),
-                    recipient_user_id=user_id,
-                )
-                metadata = await _stream_to_slack(
-                    request,
-                    run_id,
-                    streamer,
-                    client,
-                    channel_id,
-                    thread_ts,
-                    set_status=set_status,
-                    keep_alive=True,
-                    sandbox_id=existing_sandbox_id,
-                    binary_files=binary_files or None,
-                )
-                reuse_succeeded = not metadata.get("error")
-                if not reuse_succeeded:
-                    _sandbox_pool[key] = (None, lock)
-
-            if not reuse_succeeded:
-                streamer = await client.chat_stream(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    recipient_team_id=context.get("team_id"),
-                    recipient_user_id=user_id,
-                )
-                await _stream_to_slack(
-                    request,
-                    run_id,
-                    streamer,
-                    client,
-                    channel_id,
-                    thread_ts,
-                    set_status=set_status,
-                    keep_alive=True,
-                    sandbox_id_out=sandbox_id_out,
-                    binary_files=binary_files or None,
-                )
-                new_id = sandbox_id_out[0] if sandbox_id_out else None
-                _sandbox_pool.pop(key, None)
-                _sandbox_pool[key] = (new_id, lock)
-
-        # Evict oldest entries if pool is too large
-        while len(_sandbox_pool) > _MAX_SANDBOX_POOL:
-            oldest_key = next(iter(_sandbox_pool))
-            evicted_id, _ = _sandbox_pool.pop(oldest_key)
-            if evicted_id:
-                logger.debug("Evicted sandbox %s from pool (will auto-expire)", evicted_id)
+        request, binary_files = await _prepare_prompt(
+            client, channel_id, thread_ts, bot_user_id, prompt
+        )
+        await _run_in_sandbox_pool(
+            request=request,
+            run_id=run_id,
+            client=client,
+            channel=channel_id,
+            thread_ts=thread_ts,
+            context=context,
+            user_id=user_id,
+            binary_files=binary_files,
+            set_status=set_status,
+        )
 
     app.use(assistant)
 
     # ── 3. Feedback action handlers ──
 
-    @app.action("sandstorm_feedback_positive")
-    async def handle_positive(ack, body, client):
+    async def _handle_feedback(ack, body, client, *, sentiment: str, emoji: str, label: str):
         await ack()
         run_id = body["actions"][0]["value"]
         user = body["user"]["id"]
-        run_store.set_feedback(run_id, "positive", user)
+        run_store.set_feedback(run_id, sentiment, user)
 
         # Replace buttons with confirmation
         message = body.get("message", {})
         channel = body["channel"]["id"]
         ts = message.get("ts")
         blocks = message.get("blocks", [])
-        # Remove actions block, add confirmation context
         updated_blocks = [b for b in blocks if b.get("type") != "actions"]
         updated_blocks.append(
             {
                 "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": f"\U0001f44d <@{user}> found this helpful"}
-                ],
+                "elements": [{"type": "mrkdwn", "text": f"{emoji} <@{user}> {label}"}],
             }
         )
         if ts:
             await client.chat_update(
                 channel=channel, ts=ts, blocks=updated_blocks, text="Feedback recorded"
             )
+
+    @app.action("sandstorm_feedback_positive")
+    async def handle_positive(ack, body, client):
+        await _handle_feedback(
+            ack, body, client, sentiment="positive", emoji="\U0001f44d", label="found this helpful"
+        )
 
     @app.action("sandstorm_feedback_negative")
     async def handle_negative(ack, body, client):
-        await ack()
-        run_id = body["actions"][0]["value"]
-        user = body["user"]["id"]
-        run_store.set_feedback(run_id, "negative", user)
-
-        message = body.get("message", {})
-        channel = body["channel"]["id"]
-        ts = message.get("ts")
-        blocks = message.get("blocks", [])
-        updated_blocks = [b for b in blocks if b.get("type") != "actions"]
-        updated_blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"\U0001f44e <@{user}> found this not helpful",
-                    }
-                ],
-            }
+        await _handle_feedback(
+            ack,
+            body,
+            client,
+            sentiment="negative",
+            emoji="\U0001f44e",
+            label="found this not helpful",
         )
-        if ts:
-            await client.chat_update(
-                channel=channel, ts=ts, blocks=updated_blocks, text="Feedback recorded"
-            )
 
     return app
 
@@ -739,6 +762,7 @@ def run_http_mode(
     from slack_bolt.adapter.starlette.async_handler import AsyncSlackRequestHandler
     from starlette.applications import Starlette
     from starlette.requests import Request
+    from starlette.responses import JSONResponse
     from starlette.routing import Route
 
     secret = signing_secret or os.environ.get("SLACK_SIGNING_SECRET")
@@ -748,6 +772,14 @@ def run_http_mode(
     async def endpoint(req: Request):
         return await app_handler.handle(req)
 
-    starlette_app = Starlette(routes=[Route("/slack/events", endpoint=endpoint, methods=["POST"])])
+    async def health(req: Request):
+        return JSONResponse({"status": "ok"})
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/slack/events", endpoint=endpoint, methods=["POST"]),
+            Route("/health", endpoint=health, methods=["GET"]),
+        ]
+    )
     logger.info("Starting Sandstorm Slack bot in HTTP mode on %s:%d", host, port)
     uvicorn.run(starlette_app, host=host, port=port)

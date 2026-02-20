@@ -14,7 +14,9 @@ from sandstorm.slack import (  # noqa: E402
     _download_thread_files,
     _fetch_thread_messages,
     _gather_thread_context,
+    _resolve_user_names,
     _stream_to_slack,
+    _unique_filename,
 )
 from sandstorm.store import RunStore  # noqa: E402
 
@@ -67,7 +69,8 @@ class TestBuildQueryRequest:
         request = _build_query_request("hello world")
         assert request.prompt == "hello world"
         assert request.timeout == 300
-        assert request.model is None
+        assert request.model == "claude-sonnet-4-6"
+        assert request.output_format == {}
 
     def test_uses_sandstorm_slack_model_env(self, monkeypatch):
         monkeypatch.setenv("SANDSTORM_SLACK_MODEL", "opus")
@@ -174,12 +177,13 @@ class TestDownloadThreadFiles:
     def test_binary_files_returned_as_bytes(self):
         """Binary files (images, PDFs) are downloaded as bytes in the second dict."""
         client = AsyncMock()
+        client.token = "xoxb-test-token"
 
         mock_resp = AsyncMock()
         mock_resp.status = 200
         mock_resp.read = AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
 
-        # session.get() returns a sync context manager wrapper (not a coroutine)
+        # session.get() returns an async context manager
         mock_get_ctx = AsyncMock(
             __aenter__=AsyncMock(return_value=mock_resp),
             __aexit__=AsyncMock(),
@@ -187,6 +191,7 @@ class TestDownloadThreadFiles:
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_get_ctx)
 
+        # ClientSession() itself is an async context manager wrapping the loop
         mock_session_ctx = AsyncMock(
             __aenter__=AsyncMock(return_value=mock_session),
             __aexit__=AsyncMock(),
@@ -280,6 +285,110 @@ class TestDownloadThreadFiles:
         text_files, binary_files = asyncio.run(_download_thread_files(client, [], "BBOT"))
         assert text_files == {}
         assert binary_files == {}
+
+    def test_xlsx_downloaded_as_binary(self):
+        """Excel files (application/vnd.openxmlformats-*) are treated as binary."""
+        client = AsyncMock()
+        client.token = "xoxb-test-token"
+
+        xlsx_bytes = b"PK\x03\x04fake-xlsx-content"
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.read = AsyncMock(return_value=xlsx_bytes)
+
+        mock_get_ctx = AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_resp),
+            __aexit__=AsyncMock(),
+        )
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_get_ctx)
+
+        mock_session_ctx = AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_session),
+            __aexit__=AsyncMock(),
+        )
+
+        messages = [
+            {
+                "user": "U001",
+                "files": [
+                    {
+                        "id": "F001",
+                        "name": "report.xlsx",
+                        "mimetype": (
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        ),
+                        "size": 5000,
+                        "url_private": "https://example.com/report.xlsx",
+                    }
+                ],
+            }
+        ]
+        with patch("aiohttp.ClientSession", return_value=mock_session_ctx):
+            text_files, binary_files = asyncio.run(
+                _download_thread_files(client, messages, "BBOT")
+            )
+        assert text_files == {}
+        assert "report.xlsx" in binary_files
+        assert binary_files["report.xlsx"] == xlsx_bytes
+
+    def test_duplicate_filenames_get_unique_suffixes(self):
+        """Two files named data.csv should produce data.csv and data_1.csv."""
+        client = AsyncMock()
+        client.files_info = AsyncMock(
+            side_effect=[
+                {"content": "a,b\n1,2"},
+                {"content": "a,b\n3,4"},
+            ]
+        )
+        messages = [
+            {
+                "user": "U001",
+                "files": [
+                    {
+                        "id": "F001",
+                        "name": "data.csv",
+                        "mimetype": "text/csv",
+                        "size": 100,
+                        "url_private": "https://example.com/data1.csv",
+                    },
+                    {
+                        "id": "F002",
+                        "name": "data.csv",
+                        "mimetype": "text/csv",
+                        "size": 100,
+                        "url_private": "https://example.com/data2.csv",
+                    },
+                ],
+            }
+        ]
+        text_files, binary_files = asyncio.run(_download_thread_files(client, messages, "BBOT"))
+        assert "data.csv" in text_files
+        assert "data_1.csv" in text_files
+        assert text_files["data.csv"] == "a,b\n1,2"
+        assert text_files["data_1.csv"] == "a,b\n3,4"
+
+
+class TestUniqueFilename:
+    def test_first_use_unchanged(self):
+        seen: set[str] = set()
+        assert _unique_filename("file.txt", seen) == "file.txt"
+
+    def test_duplicate_gets_suffix(self):
+        seen: set[str] = set()
+        _unique_filename("file.txt", seen)
+        assert _unique_filename("file.txt", seen) == "file_1.txt"
+
+    def test_triple_duplicate(self):
+        seen: set[str] = set()
+        _unique_filename("file.txt", seen)
+        _unique_filename("file.txt", seen)
+        assert _unique_filename("file.txt", seen) == "file_2.txt"
+
+    def test_no_extension(self):
+        seen: set[str] = set()
+        _unique_filename("README", seen)
+        assert _unique_filename("README", seen) == "README_1"
 
 
 class TestStreamToSlack:
@@ -389,6 +498,50 @@ class TestStreamToSlack:
             )
 
         assert result["error"] == "Sandbox timeout"
+
+    def test_multi_turn_text_separated_by_newlines(self, mock_streamer, mock_client, tmp_path):
+        events = [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "First response"}]},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "Second response"}]},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "end_turn",
+                    "num_turns": 2,
+                    "total_cost_usd": 0.02,
+                    "model": "sonnet",
+                }
+            ),
+        ]
+
+        gen = self._make_async_generator(events)
+        request = _build_query_request("test prompt")
+
+        with (
+            patch("sandstorm.slack.run_agent_in_sandbox", gen),
+            patch("sandstorm.slack.run_store", RunStore(path=tmp_path / "runs.jsonl")),
+        ):
+            asyncio.run(
+                _stream_to_slack(
+                    request, "run-mt", mock_streamer, mock_client, "C001", "1234.5678"
+                )
+            )
+
+        calls = mock_streamer.append.call_args_list
+        # First call: no prefix
+        assert calls[0].kwargs["markdown_text"] == "First response"
+        # Second call: newline separator
+        assert calls[1].kwargs["markdown_text"] == "\n\nSecond response"
 
     def test_system_init_sets_model(self, mock_streamer, mock_client, tmp_path):
         events = [
@@ -601,3 +754,87 @@ class TestStreamToSlackSandboxParams:
             )
 
         assert captured_kwargs["binary_files"] == {"photo.png": b"\x89PNG\r\n"}
+
+
+class TestResolveUserNames:
+    def test_resolves_display_names(self):
+        client = AsyncMock()
+        client.users_info = AsyncMock(
+            return_value={
+                "user": {"profile": {"display_name": "Alice", "real_name": "Alice Smith"}}
+            }
+        )
+        messages = [{"user": "U001", "text": "hello"}]
+        result = asyncio.run(_resolve_user_names(client, messages, "BBOT"))
+        assert result == {"U001": "Alice"}
+
+    def test_falls_back_to_real_name(self):
+        client = AsyncMock()
+        client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "", "real_name": "Bob Jones"}}}
+        )
+        messages = [{"user": "U002", "text": "hi"}]
+        result = asyncio.run(_resolve_user_names(client, messages, "BBOT"))
+        assert result == {"U002": "Bob Jones"}
+
+    def test_falls_back_to_uid_on_error(self):
+        client = AsyncMock()
+        client.users_info = AsyncMock(side_effect=Exception("API error"))
+        messages = [{"user": "U003", "text": "test"}]
+        result = asyncio.run(_resolve_user_names(client, messages, "BBOT"))
+        assert result == {"U003": "U003"}
+
+    def test_excludes_bot_user(self):
+        client = AsyncMock()
+        client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Alice"}}}
+        )
+        messages = [
+            {"user": "U001", "text": "hello"},
+            {"user": "BBOT", "text": "response"},
+        ]
+        result = asyncio.run(_resolve_user_names(client, messages, "BBOT"))
+        assert "BBOT" not in result
+        assert "U001" in result
+
+    def test_resolves_multiple_users_concurrently(self):
+        """All users_info calls are made (verifies gather fans out)."""
+        client = AsyncMock()
+
+        async def _users_info(user):
+            return {"user": {"profile": {"display_name": f"Name-{user}"}}}
+
+        client.users_info = AsyncMock(side_effect=_users_info)
+        messages = [
+            {"user": "U001", "text": "hi"},
+            {"user": "U002", "text": "hello"},
+            {"user": "U003", "text": "hey"},
+        ]
+        result = asyncio.run(_resolve_user_names(client, messages, "BBOT"))
+        assert result == {"U001": "Name-U001", "U002": "Name-U002", "U003": "Name-U003"}
+        assert client.users_info.call_count == 3
+
+
+class TestGatherThreadContextWithNames:
+    def test_uses_display_names_when_provided(self):
+        messages = [
+            {"user": "U001", "text": "Hey there"},
+            {"user": "U002", "text": "Hello"},
+        ]
+        user_names = {"U001": "Alice", "U002": "Bob"}
+        result = _gather_thread_context(messages, "BBOT", user_names=user_names)
+        assert "[Alice] Hey there" in result
+        assert "[Bob] Hello" in result
+        assert "[U001]" not in result
+        assert "[U002]" not in result
+
+    def test_falls_back_to_uid_for_unknown_users(self):
+        messages = [{"user": "U999", "text": "Unknown user"}]
+        user_names = {"U001": "Alice"}
+        result = _gather_thread_context(messages, "BBOT", user_names=user_names)
+        assert "[U999] Unknown user" in result
+
+    def test_uses_raw_uid_when_names_not_provided(self):
+        messages = [{"user": "U001", "text": "Hello"}]
+        result = _gather_thread_context(messages, "BBOT")
+        assert "[U001] Hello" in result

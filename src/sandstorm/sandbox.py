@@ -79,7 +79,7 @@ def _validate_sandstorm_config(raw: dict) -> dict:
     """Validate known sandstorm.json fields, drop invalid ones with warnings."""
     # Expected field types: field_name -> (allowed types tuple, human description)
     known_fields: dict[str, tuple[tuple[type, ...], str]] = {
-        "system_prompt": ((str,), "str"),
+        "system_prompt": ((str, dict), "str or dict"),
         "model": ((str,), "str"),
         "max_turns": ((int,), "int"),
         "output_format": ((dict,), "dict"),
@@ -437,7 +437,8 @@ def _build_agent_config(
             request.output_format
             if request.output_format is not None
             else sandstorm_config.get("output_format")
-        ),
+        )
+        or None,  # empty dict = explicitly disabled
         "agents": agents_config,
         "mcp_servers": mcp_servers,
         "has_skills": has_skills,
