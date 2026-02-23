@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -35,6 +36,11 @@ SDK_VERSION = "0.2.42"
 _QUEUE_MAXSIZE = 10_000  # Buffer for sync→async bridge; drops if consumer is slow
 _SDK_INSTALL_TIMEOUT = 120  # Fallback npm install timeout (seconds)
 _RUNNER_TIMEOUT = 1800  # Max agent execution time (30 minutes)
+_MAX_EXTRACT_FILES = 10  # Max files to extract from sandbox after agent run
+_MAX_EXTRACT_FILE_SIZE = 25 * 1024 * 1024  # 25 MB per file (Slack upload limit)
+# Note: Vercel serverless has a 4.5 MB response limit — base64-encoded files
+# larger than ~3 MB will exceed this. Self-hosted and Slack deployments are unaffected.
+_MAX_EXTRACT_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB total extraction budget
 _SKILL_NAME_PATTERN = NAME_PATTERN
 
 # Load the runner script that executes inside the sandbox
@@ -72,6 +78,8 @@ _PROVIDER_ENV_KEYS = [
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    # MCP server credentials
+    "LINEAR_API_KEY",
 ]
 
 
@@ -80,6 +88,7 @@ def _validate_sandstorm_config(raw: dict) -> dict:
     # Expected field types: field_name -> (allowed types tuple, human description)
     known_fields: dict[str, tuple[tuple[type, ...], str]] = {
         "system_prompt": ((str, dict), "str or dict"),
+        "system_prompt_append": ((str,), "str"),
         "model": ((str,), "str"),
         "max_turns": ((int,), "int"),
         "output_format": ((dict,), "dict"),
@@ -88,6 +97,7 @@ def _validate_sandstorm_config(raw: dict) -> dict:
         "skills_dir": ((str,), "str"),
         "allowed_tools": ((list,), "list"),
         "webhook_url": ((str,), "str"),
+        "timeout": ((int,), "int"),
         "template_skills": ((bool,), "bool"),
     }
 
@@ -364,6 +374,85 @@ def _to_str(data) -> str:
     return data if isinstance(data, str) else str(data)
 
 
+async def _extract_generated_files(
+    sbx: AsyncSandbox,
+    input_file_names: set[str],
+    request_id: str,
+) -> list[str]:
+    """Extract new files created by the agent in /home/user/.
+
+    Lists the working directory, filters out input files / dotfiles / directories,
+    reads each new file as bytes, and returns a list of JSON-encoded file events.
+    """
+    entries = await sbx.files.list("/home/user/")
+
+    candidates = []
+    for entry in entries:
+        # Skip directories (entry.type is Optional[FileType])
+        if entry.type is None or entry.type.value != "file":
+            continue
+        # Skip dotfiles
+        if entry.name.startswith("."):
+            continue
+        # Skip files that were uploaded as input
+        if entry.name in input_file_names:
+            continue
+        # Skip known large files early (before downloading)
+        if entry.size > _MAX_EXTRACT_FILE_SIZE:
+            logger.info(
+                "[%s] Skipping oversized file: %s (%d bytes)",
+                request_id,
+                entry.name,
+                entry.size,
+            )
+            continue
+        candidates.append(entry)
+
+    if not candidates:
+        logger.debug("[%s] No new files to extract", request_id)
+        return []
+
+    if len(candidates) > _MAX_EXTRACT_FILES:
+        logger.info(
+            "[%s] Capping file extraction at %d (found %d)",
+            request_id,
+            _MAX_EXTRACT_FILES,
+            len(candidates),
+        )
+        candidates = candidates[:_MAX_EXTRACT_FILES]
+
+    events: list[str] = []
+    total_size = 0
+    for entry in candidates:
+        try:
+            data = await sbx.files.read(entry.path, format="bytes")
+            raw = data if isinstance(data, bytes) else bytes(data)
+            size = len(raw)
+
+            if total_size + size > _MAX_EXTRACT_TOTAL_SIZE:
+                logger.info("[%s] Total extraction size limit reached", request_id)
+                break
+
+            total_size += size
+            encoded = base64.b64encode(raw).decode("ascii")
+            events.append(
+                json.dumps(
+                    {
+                        "type": "file",
+                        "name": entry.name,
+                        "path": entry.path,
+                        "size": size,
+                        "data": encoded,
+                    }
+                )
+            )
+            logger.info("[%s] Extracted file: %s (%d bytes)", request_id, entry.name, size)
+        except Exception:
+            logger.warning("[%s] Failed to read %s", request_id, entry.name, exc_info=True)
+
+    return events
+
+
 def _build_agent_config(
     request: QueryRequest,
     sandstorm_config: dict,
@@ -427,12 +516,27 @@ def _build_agent_config(
     ):
         allowed_tools = [*allowed_tools, "Skill"]
 
+    # Build system prompt, then apply append from config if set
+    sys_prompt = sandstorm_config.get("system_prompt")
+    env_append = sandstorm_config.get("system_prompt_append")
+    if env_append and sys_prompt:
+        if isinstance(sys_prompt, dict) and "append" in sys_prompt:
+            sys_prompt = {**sys_prompt, "append": sys_prompt["append"] + "\n\n" + env_append}
+        elif isinstance(sys_prompt, dict):
+            sys_prompt = {**sys_prompt, "append": env_append}
+        elif isinstance(sys_prompt, str):
+            sys_prompt = sys_prompt + "\n\n" + env_append
+    elif env_append and not sys_prompt:
+        sys_prompt = env_append
+
+    timeout = request.timeout or sandstorm_config.get("timeout") or 300
+
     agent_config = {
         "prompt": request.prompt,
         "cwd": "/home/user",
         "model": request.model or sandstorm_config.get("model"),
         "max_turns": request.max_turns or sandstorm_config.get("max_turns"),
-        "system_prompt": sandstorm_config.get("system_prompt"),
+        "system_prompt": sys_prompt,
         "output_format": (
             request.output_format
             if request.output_format is not None
@@ -443,6 +547,7 @@ def _build_agent_config(
         "mcp_servers": mcp_servers,
         "has_skills": has_skills,
         "allowed_tools": allowed_tools,
+        "timeout": timeout,
     }
 
     return agent_config, merged_skills
@@ -496,12 +601,20 @@ async def run_agent_in_sandbox(
 
     agent_config, merged_skills = _build_agent_config(request, sandstorm_config, disk_skills)
     has_skills = agent_config["has_skills"]
+    timeout = agent_config["timeout"]
+
+    # Track input file names to exclude from file extraction later
+    input_file_names: set[str] = set()
+    if request.files:
+        input_file_names.update(request.files.keys())
+    if binary_files:
+        input_file_names.update(binary_files.keys())
 
     if sandbox_id:
         # --- Reconnect path: reuse an existing sandbox ---
         logger.info("[%s] Reconnecting to sandbox %s", request_id, sandbox_id)
         sbx = await AsyncSandbox.connect(sandbox_id, api_key=request.e2b_api_key)
-        await sbx.set_timeout(request.timeout)
+        await sbx.set_timeout(timeout)
         sandbox_started()
 
         # Upload extra skills that aren't already in the sandbox
@@ -556,7 +669,7 @@ async def run_agent_in_sandbox(
         if gcp_creds_content:
             sandbox_envs["GOOGLE_APPLICATION_CREDENTIALS"] = _GCP_CREDENTIALS_SANDBOX_PATH
 
-        sbx = await _create_sandbox(request.e2b_api_key, request.timeout, sandbox_envs, request_id)
+        sbx = await _create_sandbox(request.e2b_api_key, timeout, sandbox_envs, request_id)
         if sandbox_id_out is not None:
             sandbox_id_out.append(sbx.sandbox_id)
 
@@ -674,6 +787,14 @@ async def run_agent_in_sandbox(
                 model=agent_config.get("model"),
             )
 
+        # Extract files created by the agent (sandbox still alive)
+        try:
+            generated = await _extract_generated_files(sbx, input_file_names, request_id)
+            for file_event in generated:
+                yield file_event
+        except Exception:
+            logger.warning("[%s] File extraction failed", request_id, exc_info=True)
+
     finally:
         sandbox_stopped()
         if keep_alive:
@@ -690,7 +811,7 @@ async def run_agent_in_sandbox(
                 "[%s] Keeping sandbox %s alive (timeout=%ds)",
                 request_id,
                 sbx.sandbox_id,
-                request.timeout,
+                timeout,
             )
         else:
             await _cleanup(task, sbx, request_id)

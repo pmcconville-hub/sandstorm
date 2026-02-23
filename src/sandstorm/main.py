@@ -21,6 +21,7 @@ from sse_starlette.sse import EventSourceResponse
 from . import _LOG_DATEFMT, _LOG_FORMAT, __version__, telemetry
 from .models import QueryRequest
 from .sandbox import load_sandstorm_config, run_agent_in_sandbox
+from .slack_routes import router as slack_router
 from .store import run_store
 from .telemetry import (
     get_tracer,
@@ -151,6 +152,9 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Mount Slack events endpoint
+app.include_router(slack_router)
 
 
 _DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text()

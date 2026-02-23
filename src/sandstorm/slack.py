@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -22,8 +23,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Max file size to download from Slack threads (10 MB)
-_MAX_FILE_SIZE = 10 * 1024 * 1024
+# Max file size to download from Slack threads (50 MB)
+_MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # Max sandbox pool entries (one per active thread)
 _MAX_SANDBOX_POOL = 1000
@@ -101,22 +102,14 @@ def _build_metadata_blocks(
 
 
 def _build_query_request(prompt: str, files: dict[str, str] | None = None) -> QueryRequest:
-    """Build QueryRequest from prompt + env var defaults.
+    """Build QueryRequest from prompt, deferring model/timeout to sandstorm.json.
 
-    Uses SANDSTORM_SLACK_MODEL, SANDSTORM_SLACK_TIMEOUT env vars.
     API keys resolved by QueryRequest.resolve_api_keys() as usual.
     """
-    model = os.environ.get("SANDSTORM_SLACK_MODEL", "claude-sonnet-4-6")
-    timeout_str = os.environ.get("SANDSTORM_SLACK_TIMEOUT", "300")
-    try:
-        timeout = int(timeout_str)
-    except ValueError:
-        timeout = 300
-
     return QueryRequest(
         prompt=prompt,
-        model=model,
-        timeout=timeout,
+        model=None,
+        timeout=None,
         files=files,
         output_format={},  # Slack is conversational — skip structured output
         anthropic_api_key=None,
@@ -245,7 +238,7 @@ async def _download_thread_files(
     Returns (text_files, binary_files):
       - text_files: {filename: str_content} for QueryRequest.files
       - binary_files: {filename: bytes_content} for sandbox upload
-    Skips files > 10MB.
+    Skips files > 50MB.
     """
     try:
         import aiohttp
@@ -441,6 +434,33 @@ async def _stream_to_slack(
 
                 run_store.fail(run_id, error_msg, metadata["duration_secs"])
 
+            elif event_type == "file":
+                file_name = event.get("name", "file")
+                file_data_b64 = event.get("data")
+                if file_data_b64:
+                    try:
+                        file_data = base64.b64decode(file_data_b64)
+                        await client.files_upload_v2(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            content=file_data,
+                            filename=file_name,
+                            title=file_name,
+                        )
+                        logger.info(
+                            "[%s] Uploaded file %s (%d bytes)",
+                            run_id,
+                            file_name,
+                            len(file_data),
+                        )
+                    except Exception:
+                        logger.error(
+                            "[%s] Failed to upload %s to Slack",
+                            run_id,
+                            file_name,
+                            exc_info=True,
+                        )
+
             # Skip user, stderr, warning events (log server-side only)
             elif event_type in ("user", "stderr", "warning"):
                 logger.debug("[%s] %s", run_id, event_type)
@@ -463,14 +483,21 @@ async def _stream_to_slack(
 
 
 def create_slack_app(
-    *, bot_token: str | None = None, signing_secret: str | None = None
+    *,
+    bot_token: str | None = None,
+    signing_secret: str | None = None,
+    process_before_response: bool = False,
 ) -> AsyncApp:
     """Create and configure the Slack Bolt AsyncApp."""
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.middleware.assistant.async_assistant import AsyncAssistant
 
     token = bot_token or os.environ.get("SLACK_BOT_TOKEN")
-    app = AsyncApp(token=token, signing_secret=signing_secret)
+    app = AsyncApp(
+        token=token,
+        signing_secret=signing_secret,
+        process_before_response=process_before_response,
+    )
 
     # Sandbox reuse pool: (channel, thread_ts) -> (sandbox_id, lock)
     # Lock serializes concurrent @mentions in the same thread
@@ -556,6 +583,11 @@ def create_slack_app(
                     )
 
             if not reuse_succeeded:
+                if existing_sandbox_id:
+                    # Fresh run_id for the retry — the failed reuse attempt
+                    # already recorded its own run entry and Slack message.
+                    run_id = uuid.uuid4().hex[:8]
+
                 streamer = await client.chat_stream(
                     channel=channel,
                     thread_ts=thread_ts,
